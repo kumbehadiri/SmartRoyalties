@@ -147,3 +147,182 @@
     )
 )
 
+(define-map work-categories
+    principal
+    (list 10 (string-ascii 20))
+)
+
+(define-public (add-work-categories (categories (list 10 (string-ascii 20))))
+    (let ((work (unwrap! (map-get? creative-works tx-sender) err-not-found)))
+        (ok (map-set work-categories tx-sender categories))
+    )
+)
+
+(define-read-only (get-work-categories (owner principal))
+    (ok (map-get? work-categories owner))
+)
+
+
+(define-map pricing-tiers
+    principal
+    {
+        basic: uint,
+        premium: uint,
+        enterprise: uint
+    }
+)
+
+(define-public (set-work-pricing (basic uint) (premium uint) (enterprise uint))
+    (let ((work (unwrap! (map-get? creative-works tx-sender) err-not-found)))
+        (ok (map-set pricing-tiers tx-sender {
+            basic: basic,
+            premium: premium,
+            enterprise: enterprise
+        }))
+    )
+)
+
+(define-public (pay-tiered-royalty (work-owner principal) (tier (string-ascii 10)))
+    (let (
+        (prices (unwrap! (map-get? pricing-tiers work-owner) err-not-found))
+        (amount (if (is-eq tier "basic")
+            (get basic prices)
+            (if (is-eq tier "premium")
+                (get premium prices)
+                (get enterprise prices))))
+    )
+        (try! (pay-royalty work-owner amount))
+        (ok true)
+    )
+)
+
+
+(define-map revenue-pools
+    (string-ascii 50)
+    {
+        members: (list 50 principal),
+        share-percentages: (list 50 uint),
+        total-earnings: uint
+    }
+)
+
+(define-public (create-revenue-pool (pool-name (string-ascii 50)) (members (list 50 principal)) (percentages (list 50 uint)))
+    (ok (map-set revenue-pools pool-name {
+        members: members,
+        share-percentages: percentages,
+        total-earnings: u0
+    }))
+)
+
+(define-public (distribute-pool-earnings (pool-name (string-ascii 50)) (amount uint))
+    (let ((pool (unwrap! (map-get? revenue-pools pool-name) err-not-found)))
+        (try! (stx-transfer? amount tx-sender contract-owner))
+        (ok (map-set revenue-pools pool-name 
+            (merge pool {total-earnings: (+ (get total-earnings pool) amount)})))
+    )
+)
+
+
+(define-map work-versions
+    { owner: principal, version: uint }
+    {
+        hash: (string-ascii 64),
+        timestamp: uint,
+        changes: (string-ascii 200)
+    }
+)
+
+(define-public (add-work-version (hash (string-ascii 64)) (changes (string-ascii 200)))
+    (let (
+        (work (unwrap! (map-get? creative-works tx-sender) err-not-found))
+        (version-count (unwrap! (get-last-version tx-sender) err-not-found))
+    )
+        (ok (map-set work-versions 
+            {owner: tx-sender, version: (+ version-count u1)}
+            {hash: hash, timestamp: stacks-block-height, changes: changes}))
+    )
+)
+
+(define-read-only (get-last-version (owner principal))
+    (ok (default-to u0 (get timestamp (map-get? work-versions {owner: owner, version: u1}))))
+)
+
+
+(define-map subscriptions
+    { subscriber: principal, creator: principal }
+    {
+        start-height: uint,
+        end-height: uint,
+        subscription-type: (string-ascii 10)
+    }
+)
+
+(define-public (create-subscription (creator principal) (duration uint) (sub-type (string-ascii 10)))
+    (ok (map-set subscriptions 
+        {subscriber: tx-sender, creator: creator}
+        {
+            start-height: stacks-block-height,
+            end-height: (+ stacks-block-height duration),
+            subscription-type: sub-type
+        }))
+)
+
+(define-read-only (check-subscription (subscriber principal) (creator principal))
+    (let ((sub (map-get? subscriptions {subscriber: subscriber, creator: creator})))
+        (ok (and (is-some sub)
+            (< stacks-block-height (get end-height (unwrap-panic sub)))))
+    )
+)
+
+
+(define-map collaborations
+    (string-ascii 50)
+    {
+        creators: (list 10 principal),
+        split-percentages: (list 10 uint),
+        work-status: (string-ascii 10)
+    }
+)
+
+(define-public (create-collaboration (collab-id (string-ascii 50)) (creators (list 10 principal)) (splits (list 10 uint)))
+    (ok (map-set collaborations collab-id {
+        creators: creators,
+        split-percentages: splits,
+        work-status: "active"
+    }))
+)
+
+(define-public (update-collab-status (collab-id (string-ascii 50)) (status (string-ascii 10)))
+    (let ((collab (unwrap! (map-get? collaborations collab-id) err-not-found)))
+        (ok (map-set collaborations collab-id 
+            (merge collab {work-status: status})))
+    )
+)
+
+(define-map work-analytics
+    principal
+    {
+        views: uint,
+        unique-users: uint,
+        peak-earnings: uint,
+        last-updated: uint
+    }
+)
+
+(define-public (update-analytics (work-owner principal))
+    (let (
+        (current-stats (default-to 
+            {views: u0, unique-users: u0, peak-earnings: u0, last-updated: u0} 
+            (map-get? work-analytics work-owner)))
+    )
+        (ok (map-set work-analytics work-owner
+            (merge current-stats {
+                views: (+ (get views current-stats) u1),
+                last-updated: stacks-block-height
+            })))
+    )
+)
+
+(define-read-only (get-work-analytics (owner principal))
+    (ok (map-get? work-analytics owner))
+)
