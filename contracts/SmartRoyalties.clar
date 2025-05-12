@@ -326,3 +326,102 @@
 (define-read-only (get-work-analytics (owner principal))
     (ok (map-get? work-analytics owner))
 )
+
+
+(define-map promotional-discounts
+    { owner: principal, promo-id: uint }
+    {
+        start-height: uint,
+        end-height: uint,
+        discount-percentage: uint,
+        active: bool
+    }
+)
+
+(define-data-var promo-counter uint u0)
+
+(define-public (create-promotion (duration uint) (discount uint))
+    (let
+        ((work (unwrap! (map-get? creative-works tx-sender) err-not-found))
+         (promo-id (+ (var-get promo-counter) u1)))
+        (asserts! (<= discount u1000) err-invalid-percentage)
+        (var-set promo-counter promo-id)
+        (ok (map-set promotional-discounts
+            { owner: tx-sender, promo-id: promo-id }
+            {
+                start-height: stacks-block-height,
+                end-height: (+ stacks-block-height duration),
+                discount-percentage: discount,
+                active: true
+            }
+        ))
+    )
+)
+
+(define-read-only (get-discounted-price (owner principal) (original-price uint))
+    (let
+        ((promo (map-get? promotional-discounts { owner: owner, promo-id: (var-get promo-counter) })))
+        (if (and 
+            (is-some promo)
+            (active-promotion? (unwrap-panic promo)))
+            (let ((discount (get discount-percentage (unwrap-panic promo))))
+                (ok (- original-price (/ (* original-price discount) u1000))))
+            (ok original-price)
+        )
+    )
+)
+
+(define-private (active-promotion? (promo {start-height: uint, end-height: uint, discount-percentage: uint, active: bool}))
+    (and
+        (get active promo)
+        (>= (get end-height promo) stacks-block-height)
+        (<= (get start-height promo) stacks-block-height)
+    )
+)
+
+
+(define-map work-bundles
+    (string-ascii 50)
+    {
+        creator: principal,
+        works: (list 10 principal),
+        bundle-price: uint,
+        active: bool
+    }
+)
+
+(define-public (create-bundle (bundle-id (string-ascii 50)) (works (list 10 principal)) (price uint))
+    (let
+        ((work-exists (map-get? work-bundles bundle-id)))
+        (asserts! (is-none work-exists) err-already-registered)
+        (ok (map-set work-bundles bundle-id
+            {
+                creator: tx-sender,
+                works: works,
+                bundle-price: price,
+                active: true
+            }
+        ))
+    )
+)
+
+(define-public (purchase-bundle (bundle-id (string-ascii 50)))
+    (let
+        ((bundle (unwrap! (map-get? work-bundles bundle-id) err-not-found)))
+        (asserts! (get active bundle) err-unauthorized)
+        (try! (stx-transfer? (get bundle-price bundle) tx-sender (get creator bundle)))
+        (map register-bundle-access (get works bundle))
+        (ok true)
+    )
+)
+
+(define-private (register-bundle-access (work-owner principal))
+    (map-set usage-tracking
+        {work-owner: work-owner, user: tx-sender}
+        {
+            last-payment: stacks-block-height,
+            total-paid: u0,
+            license-expiry: (+ stacks-block-height u14400)
+        }
+    )
+)
