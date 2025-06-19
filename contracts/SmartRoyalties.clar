@@ -425,3 +425,201 @@
         }
     )
 )
+
+
+(define-map escrow-accounts
+    { depositor: principal, work-owner: principal }
+    {
+        balance: uint,
+        auto-pay-amount: uint,
+        auto-pay-interval: uint,
+        last-auto-pay: uint,
+        active: bool
+    }
+)
+
+(define-map escrow-transactions
+    { depositor: principal, work-owner: principal, tx-id: uint }
+    {
+        amount: uint,
+        transaction-type: (string-ascii 10),
+        timestamp: uint
+    }
+)
+
+(define-data-var escrow-tx-counter uint u0)
+
+(define-public (create-escrow-account (work-owner principal) (initial-deposit uint) (auto-amount uint) (interval uint))
+    (let
+        ((work (unwrap! (map-get? creative-works work-owner) err-not-found))
+         (tx-id (+ (var-get escrow-tx-counter) u1)))
+        (try! (stx-transfer? initial-deposit tx-sender (as-contract tx-sender)))
+        (var-set escrow-tx-counter tx-id)
+        (map-set escrow-accounts
+            { depositor: tx-sender, work-owner: work-owner }
+            {
+                balance: initial-deposit,
+                auto-pay-amount: auto-amount,
+                auto-pay-interval: interval,
+                last-auto-pay: stacks-block-height,
+                active: true
+            }
+        )
+        (map-set escrow-transactions
+            { depositor: tx-sender, work-owner: work-owner, tx-id: tx-id }
+            {
+                amount: initial-deposit,
+                transaction-type: "deposit",
+                timestamp: stacks-block-height
+            }
+        )
+        (ok tx-id)
+    )
+)
+
+(define-public (deposit-to-escrow (work-owner principal) (amount uint))
+    (let
+        ((account (unwrap! (map-get? escrow-accounts { depositor: tx-sender, work-owner: work-owner }) err-not-found))
+         (tx-id (+ (var-get escrow-tx-counter) u1)))
+        (asserts! (get active account) err-unauthorized)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set escrow-tx-counter tx-id)
+        (map-set escrow-accounts
+            { depositor: tx-sender, work-owner: work-owner }
+            (merge account { balance: (+ (get balance account) amount) })
+        )
+        (map-set escrow-transactions
+            { depositor: tx-sender, work-owner: work-owner, tx-id: tx-id }
+            {
+                amount: amount,
+                transaction-type: "deposit",
+                timestamp: stacks-block-height
+            }
+        )
+        (ok tx-id)
+    )
+)
+
+(define-public (process-auto-payment (depositor principal) (work-owner principal))
+    (let
+        ((account (unwrap! (map-get? escrow-accounts { depositor: depositor, work-owner: work-owner }) err-not-found))
+         (work (unwrap! (map-get? creative-works work-owner) err-not-found))
+         (auto-amount (get auto-pay-amount account))
+         (current-balance (get balance account))
+         (platform-cut (/ (* auto-amount (var-get platform-fee)) u1000))
+         (creator-amount (- auto-amount platform-cut))
+         (tx-id (+ (var-get escrow-tx-counter) u1)))
+        (asserts! (get active account) err-unauthorized)
+        (asserts! (>= current-balance auto-amount) err-not-found)
+        (asserts! (>= stacks-block-height (+ (get last-auto-pay account) (get auto-pay-interval account))) err-unauthorized)
+        
+        (try! (as-contract (stx-transfer? platform-cut tx-sender contract-owner)))
+        (try! (as-contract (stx-transfer? creator-amount tx-sender work-owner)))
+        
+        (var-set escrow-tx-counter tx-id)
+        (map-set escrow-accounts
+            { depositor: depositor, work-owner: work-owner }
+            (merge account {
+                balance: (- current-balance auto-amount),
+                last-auto-pay: stacks-block-height
+            })
+        )
+        
+        (map-set escrow-transactions
+            { depositor: depositor, work-owner: work-owner, tx-id: tx-id }
+            {
+                amount: auto-amount,
+                transaction-type: "payment",
+                timestamp: stacks-block-height
+            }
+        )
+        
+        (map-set usage-tracking { work-owner: work-owner, user: depositor }
+            {
+                last-payment: stacks-block-height,
+                total-paid: (+ auto-amount (default-to u0 (get total-paid (map-get? usage-tracking { work-owner: work-owner, user: depositor })))),
+                license-expiry: (+ stacks-block-height u1440)
+            }
+        )
+        
+        (map-set creative-works work-owner
+            (merge work { total-earnings: (+ (get total-earnings work) auto-amount) })
+        )
+        
+        (ok tx-id)
+    )
+)
+
+(define-public (withdraw-from-escrow (work-owner principal) (amount uint))
+    (let
+        ((account (unwrap! (map-get? escrow-accounts { depositor: tx-sender, work-owner: work-owner }) err-not-found))
+         (tx-id (+ (var-get escrow-tx-counter) u1)))
+        (asserts! (get active account) err-unauthorized)
+        (asserts! (>= (get balance account) amount) err-not-found)
+        
+        (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+        (var-set escrow-tx-counter tx-id)
+        (map-set escrow-accounts
+            { depositor: tx-sender, work-owner: work-owner }
+            (merge account { balance: (- (get balance account) amount) })
+        )
+        
+        (map-set escrow-transactions
+            { depositor: tx-sender, work-owner: work-owner, tx-id: tx-id }
+            {
+                amount: amount,
+                transaction-type: "withdraw",
+                timestamp: stacks-block-height
+            }
+        )
+        (ok tx-id)
+    )
+)
+
+(define-public (update-auto-payment-settings (work-owner principal) (new-amount uint) (new-interval uint))
+    (let
+        ((account (unwrap! (map-get? escrow-accounts { depositor: tx-sender, work-owner: work-owner }) err-not-found)))
+        (asserts! (get active account) err-unauthorized)
+        (ok (map-set escrow-accounts
+            { depositor: tx-sender, work-owner: work-owner }
+            (merge account {
+                auto-pay-amount: new-amount,
+                auto-pay-interval: new-interval
+            })
+        ))
+    )
+)
+
+(define-public (deactivate-escrow-account (work-owner principal))
+    (let
+        ((account (unwrap! (map-get? escrow-accounts { depositor: tx-sender, work-owner: work-owner }) err-not-found)))
+        (ok (map-set escrow-accounts
+            { depositor: tx-sender, work-owner: work-owner }
+            (merge account { active: false })
+        ))
+    )
+)
+
+(define-read-only (get-escrow-account (depositor principal) (work-owner principal))
+    (ok (map-get? escrow-accounts { depositor: depositor, work-owner: work-owner }))
+)
+
+(define-read-only (get-escrow-transaction (depositor principal) (work-owner principal) (tx-id uint))
+    (ok (map-get? escrow-transactions { depositor: depositor, work-owner: work-owner, tx-id: tx-id }))
+)
+
+(define-read-only (check-auto-payment-due (depositor principal) (work-owner principal))
+    (let
+        ((account (map-get? escrow-accounts { depositor: depositor, work-owner: work-owner })))
+        (if (is-some account)
+            (let ((acc (unwrap-panic account)))
+                (ok (and
+                    (get active acc)
+                    (>= stacks-block-height (+ (get last-auto-pay acc) (get auto-pay-interval acc)))
+                    (>= (get balance acc) (get auto-pay-amount acc))
+                ))
+            )
+            (ok false)
+        )
+    )
+)
