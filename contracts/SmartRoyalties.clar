@@ -600,6 +600,161 @@
     )
 )
 
+(define-constant err-dispute-not-found (err u105))
+(define-constant err-dispute-already-resolved (err u106))
+(define-constant err-invalid-dispute-status (err u107))
+(define-constant err-dispute-already-exists (err u108))
+
+(define-data-var dispute-counter uint u0)
+
+(define-map work-disputes
+    uint
+    {
+        dispute-id: uint,
+        work-owner: principal,
+        complainant: principal,
+        dispute-type: (string-ascii 20),
+        description: (string-ascii 300),
+        status: (string-ascii 15),
+        created-at: uint,
+        resolved-at: uint,
+        resolution: (string-ascii 200),
+        evidence-hash: (string-ascii 64)
+    }
+)
+
+(define-map dispute-votes
+    {dispute-id: uint, voter: principal}
+    {
+        vote: (string-ascii 10),
+        timestamp: uint
+    }
+)
+
+(define-map dispute-evidence
+    {dispute-id: uint, evidence-id: uint}
+    {
+        submitter: principal,
+        evidence-type: (string-ascii 20),
+        evidence-hash: (string-ascii 64),
+        timestamp: uint
+    }
+)
+
+(define-public (file-dispute (work-owner principal) (dispute-type (string-ascii 20)) (description (string-ascii 300)) (evidence-hash (string-ascii 64)))
+    (let
+        ((work (unwrap! (map-get? creative-works work-owner) err-not-found))
+         (dispute-id (+ (var-get dispute-counter) u1)))
+        (asserts! (not (is-eq tx-sender work-owner)) err-unauthorized)
+        (var-set dispute-counter dispute-id)
+        (map-set work-disputes dispute-id
+            {
+                dispute-id: dispute-id,
+                work-owner: work-owner,
+                complainant: tx-sender,
+                dispute-type: dispute-type,
+                description: description,
+                status: "pending",
+                created-at: stacks-block-height,
+                resolved-at: u0,
+                resolution: "",
+                evidence-hash: evidence-hash
+            }
+        )
+        (ok dispute-id)
+    )
+)
+
+(define-public (submit-dispute-evidence (dispute-id uint) (evidence-type (string-ascii 20)) (evidence-hash (string-ascii 64)))
+    (let
+        ((dispute (unwrap! (map-get? work-disputes dispute-id) err-dispute-not-found))
+         (evidence-id (+ dispute-id u1)))
+        (asserts! (is-eq (get status dispute) "pending") err-dispute-already-resolved)
+        (asserts! (or (is-eq tx-sender (get work-owner dispute)) (is-eq tx-sender (get complainant dispute))) err-unauthorized)
+        (map-set dispute-evidence
+            {dispute-id: dispute-id, evidence-id: evidence-id}
+            {
+                submitter: tx-sender,
+                evidence-type: evidence-type,
+                evidence-hash: evidence-hash,
+                timestamp: stacks-block-height
+            }
+        )
+        (ok evidence-id)
+    )
+)
+
+(define-public (vote-on-dispute (dispute-id uint) (vote (string-ascii 10)))
+    (let
+        ((dispute (unwrap! (map-get? work-disputes dispute-id) err-dispute-not-found)))
+        (asserts! (is-eq (get status dispute) "pending") err-dispute-already-resolved)
+        (asserts! (not (is-eq tx-sender (get work-owner dispute))) err-unauthorized)
+        (asserts! (not (is-eq tx-sender (get complainant dispute))) err-unauthorized)
+        (map-set dispute-votes
+            {dispute-id: dispute-id, voter: tx-sender}
+            {
+                vote: vote,
+                timestamp: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint) (resolution (string-ascii 200)) (final-status (string-ascii 15)))
+    (let
+        ((dispute (unwrap! (map-get? work-disputes dispute-id) err-dispute-not-found)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-eq (get status dispute) "pending") err-dispute-already-resolved)
+        (map-set work-disputes dispute-id
+            (merge dispute {
+                status: final-status,
+                resolved-at: stacks-block-height,
+                resolution: resolution
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (escalate-dispute (dispute-id uint))
+    (let
+        ((dispute (unwrap! (map-get? work-disputes dispute-id) err-dispute-not-found)))
+        (asserts! (is-eq (get status dispute) "pending") err-dispute-already-resolved)
+        (asserts! (or (is-eq tx-sender (get work-owner dispute)) (is-eq tx-sender (get complainant dispute))) err-unauthorized)
+        (map-set work-disputes dispute-id
+            (merge dispute {status: "escalated"})
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-dispute-details (dispute-id uint))
+    (ok (map-get? work-disputes dispute-id))
+)
+
+(define-read-only (get-dispute-vote (dispute-id uint) (voter principal))
+    (ok (map-get? dispute-votes {dispute-id: dispute-id, voter: voter}))
+)
+
+(define-read-only (get-dispute-evidence (dispute-id uint) (evidence-id uint))
+    (ok (map-get? dispute-evidence {dispute-id: dispute-id, evidence-id: evidence-id}))
+)
+
+(define-read-only (get-total-disputes)
+    (ok (var-get dispute-counter))
+)
+
+(define-read-only (check-dispute-status (dispute-id uint))
+    (let
+        ((dispute (map-get? work-disputes dispute-id)))
+        (if (is-some dispute)
+            (ok (get status (unwrap-panic dispute)))
+            (ok "not-found")
+        )
+    )
+)
+
 (define-read-only (get-escrow-account (depositor principal) (work-owner principal))
     (ok (map-get? escrow-accounts { depositor: depositor, work-owner: work-owner }))
 )
