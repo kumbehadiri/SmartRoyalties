@@ -8,6 +8,9 @@
 (define-constant err-already-registered (err u102))
 (define-constant err-invalid-percentage (err u103))
 (define-constant err-unauthorized (err u104))
+(define-constant err-invalid-adjustment-rule (err u109))
+(define-constant err-rate-below-minimum (err u110))
+(define-constant err-rate-above-maximum (err u111))
 
 ;; Data Variables
 (define-data-var platform-fee uint u50) ;; 5% platform fee (represented as basis points)
@@ -623,6 +626,298 @@
     }
 )
 
+;; Dynamic Royalty Rate Adjustment System
+
+;; Data maps for dynamic pricing
+(define-map dynamic-pricing-rules
+    principal
+    {
+        enabled: bool,
+        base-rate: uint,
+        min-rate: uint,
+        max-rate: uint,
+        adjustment-factor: uint,
+        peak-hours-start: uint,
+        peak-hours-end: uint,
+        peak-multiplier: uint
+    }
+)
+
+(define-map usage-metrics
+    principal
+    {
+        daily-usage-count: uint,
+        weekly-usage-count: uint,
+        last-usage-day: uint,
+        last-usage-week: uint,
+        popularity-score: uint,
+        current-adjusted-rate: uint
+    }
+)
+
+(define-map rate-history
+    {work-owner: principal, timestamp: uint}
+    {
+        old-rate: uint,
+        new-rate: uint,
+        adjustment-reason: (string-ascii 30),
+        usage-count: uint
+    }
+)
+
+;; Configure dynamic pricing rules for a work
+(define-public (configure-dynamic-pricing 
+    (base-rate uint) 
+    (min-rate uint) 
+    (max-rate uint) 
+    (adjustment-factor uint)
+    (peak-start uint)
+    (peak-end uint)
+    (peak-multiplier uint))
+    (let ((work (unwrap! (map-get? creative-works tx-sender) err-not-found)))
+        (asserts! (<= min-rate base-rate) err-rate-below-minimum)
+        (asserts! (<= base-rate max-rate) err-rate-above-maximum)
+        (asserts! (<= adjustment-factor u500) err-invalid-adjustment-rule) ;; Max 50% adjustment
+        (asserts! (< peak-start u24) err-invalid-adjustment-rule) ;; Valid hour
+        (asserts! (< peak-end u24) err-invalid-adjustment-rule) ;; Valid hour
+        (asserts! (<= peak-multiplier u300) err-invalid-adjustment-rule) ;; Max 3x multiplier
+        
+        (map-set dynamic-pricing-rules tx-sender {
+            enabled: true,
+            base-rate: base-rate,
+            min-rate: min-rate,
+            max-rate: max-rate,
+            adjustment-factor: adjustment-factor,
+            peak-hours-start: peak-start,
+            peak-hours-end: peak-end,
+            peak-multiplier: peak-multiplier
+        })
+        
+        ;; Initialize usage metrics
+        (map-set usage-metrics tx-sender {
+            daily-usage-count: u0,
+            weekly-usage-count: u0,
+            last-usage-day: (get-current-day),
+            last-usage-week: (get-current-week),
+            popularity-score: u100, ;; Start with base score
+            current-adjusted-rate: base-rate
+        })
+        
+        (ok true)
+    )
+)
+
+;; Calculate adjusted rate based on current metrics
+(define-public (calculate-adjusted-rate (work-owner principal))
+    (let (
+        (pricing-rules (unwrap! (map-get? dynamic-pricing-rules work-owner) err-not-found))
+        (metrics (unwrap! (map-get? usage-metrics work-owner) err-not-found))
+        (current-hour (mod stacks-block-height u144)) ;; Rough hour calculation
+        (current-day (get-current-day))
+        (current-week (get-current-week))
+    )
+        (asserts! (get enabled pricing-rules) err-unauthorized)
+        
+        ;; Reset daily/weekly counters if needed
+        (let (
+            (updated-metrics (update-usage-counters metrics current-day current-week))
+            (base-rate (get base-rate pricing-rules))
+            (popularity-adjustment (calculate-popularity-adjustment 
+                (get popularity-score updated-metrics) 
+                (get adjustment-factor pricing-rules)))
+            (time-adjustment (calculate-time-adjustment 
+                current-hour 
+                (get peak-hours-start pricing-rules)
+                (get peak-hours-end pricing-rules)
+                (get peak-multiplier pricing-rules)))
+        )
+            (let (
+                (adjusted-rate (apply-rate-adjustments 
+                    base-rate 
+                    popularity-adjustment 
+                    time-adjustment))
+                (final-rate (enforce-rate-limits 
+                    adjusted-rate 
+                    (get min-rate pricing-rules) 
+                    (get max-rate pricing-rules)))
+            )
+                ;; Update current rate in metrics
+                (map-set usage-metrics work-owner
+                    (merge updated-metrics {current-adjusted-rate: final-rate}))
+                
+                (ok final-rate)
+            )
+        )
+    )
+)
+
+;; Update usage metrics when payment occurs
+(define-public (track-usage-and-update-rate (work-owner principal))
+    (let (
+        (metrics (unwrap! (map-get? usage-metrics work-owner) err-not-found))
+        (current-day (get-current-day))
+        (current-week (get-current-week))
+        (updated-daily (+ (get daily-usage-count metrics) u1))
+        (updated-weekly (+ (get weekly-usage-count metrics) u1))
+    )
+        ;; Update usage counts
+        (map-set usage-metrics work-owner
+            (merge metrics {
+                daily-usage-count: updated-daily,
+                weekly-usage-count: updated-weekly,
+                last-usage-day: current-day,
+                last-usage-week: current-week,
+                popularity-score: (calculate-new-popularity-score 
+                    (get popularity-score metrics) 
+                    updated-daily 
+                    updated-weekly)
+            }))
+        
+        ;; Recalculate adjusted rate
+        (calculate-adjusted-rate work-owner)
+    )
+)
+
+;; Enhanced pay-royalty with dynamic pricing
+(define-public (pay-dynamic-royalty (work-owner principal))
+    (let (
+        (work (unwrap! (map-get? creative-works work-owner) err-not-found))
+        (pricing-rules (map-get? dynamic-pricing-rules work-owner))
+    )
+        (if (is-some pricing-rules)
+            ;; Use dynamic pricing
+            (let (
+                (adjusted-rate (unwrap! (calculate-adjusted-rate work-owner) err-not-found))
+                (old-rate (get current-adjusted-rate 
+                    (unwrap! (map-get? usage-metrics work-owner) err-not-found)))
+            )
+                ;; Record rate change if significant
+                (if (> (abs-diff adjusted-rate old-rate) u10) ;; 1% change threshold
+                    (map-set rate-history 
+                        {work-owner: work-owner, timestamp: stacks-block-height}
+                        {
+                            old-rate: old-rate,
+                            new-rate: adjusted-rate,
+                            adjustment-reason: "usage-based",
+                            usage-count: (get daily-usage-count 
+                                (unwrap! (map-get? usage-metrics work-owner) err-not-found))
+                        })
+                    true)
+                
+                ;; Update usage and pay
+                (try! (track-usage-and-update-rate work-owner))
+                (pay-royalty work-owner adjusted-rate)
+            )
+            ;; Fall back to regular pricing
+            (pay-royalty work-owner (get royalty-percentage work))
+        )
+    )
+)
+
+;; Disable dynamic pricing
+(define-public (disable-dynamic-pricing)
+    (let ((pricing-rules (unwrap! (map-get? dynamic-pricing-rules tx-sender) err-not-found)))
+        (ok (map-set dynamic-pricing-rules tx-sender
+            (merge pricing-rules {enabled: false})))
+    )
+)
+
+;; Read-only functions for dynamic pricing
+
+(define-read-only (get-dynamic-pricing-rules (work-owner principal))
+    (ok (map-get? dynamic-pricing-rules work-owner))
+)
+
+(define-read-only (get-usage-metrics (work-owner principal))
+    (ok (map-get? usage-metrics work-owner))
+)
+
+(define-read-only (get-rate-history (work-owner principal) (timestamp uint))
+    (ok (map-get? rate-history {work-owner: work-owner, timestamp: timestamp}))
+)
+
+(define-read-only (get-current-adjusted-rate (work-owner principal))
+    (let ((metrics (map-get? usage-metrics work-owner)))
+        (if (is-some metrics)
+            (ok (some (get current-adjusted-rate (unwrap-panic metrics))))
+            (ok none)
+        )
+    )
+)
+
+;; Private helper functions
+
+(define-private (get-current-day)
+    (/ stacks-block-height u144) ;; Approximately 1 day in blocks
+)
+
+(define-private (get-current-week)
+    (/ stacks-block-height u1008) ;; Approximately 1 week in blocks
+)
+
+(define-private (update-usage-counters (metrics {daily-usage-count: uint, weekly-usage-count: uint, last-usage-day: uint, last-usage-week: uint, popularity-score: uint, current-adjusted-rate: uint}) (current-day uint) (current-week uint))
+    (let (
+        (daily-count (if (> current-day (get last-usage-day metrics)) u0 (get daily-usage-count metrics)))
+        (weekly-count (if (> current-week (get last-usage-week metrics)) u0 (get weekly-usage-count metrics)))
+    )
+        (merge metrics {
+            daily-usage-count: daily-count,
+            weekly-usage-count: weekly-count
+        })
+    )
+)
+
+(define-private (calculate-popularity-adjustment (popularity-score uint) (adjustment-factor uint))
+    (if (> popularity-score u150) ;; High popularity
+        adjustment-factor ;; Increase rate
+        (if (< popularity-score u50) ;; Low popularity
+            (- u0 adjustment-factor) ;; Decrease rate
+            u0 ;; No change
+        )
+    )
+)
+
+(define-private (calculate-time-adjustment (current-hour uint) (peak-start uint) (peak-end uint) (peak-multiplier uint))
+    (if (and (>= current-hour peak-start) (<= current-hour peak-end))
+        peak-multiplier ;; Peak hours multiplier
+        u100 ;; Regular hours (100% = no change)
+    )
+)
+
+(define-private (apply-rate-adjustments (base-rate uint) (popularity-adj uint) (time-adj uint))
+    (let (
+        (popularity-adjusted (+ base-rate (/ (* base-rate popularity-adj) u1000)))
+        (time-adjusted (/ (* popularity-adjusted time-adj) u100))
+    )
+        time-adjusted
+    )
+)
+
+(define-private (enforce-rate-limits (rate uint) (min-rate uint) (max-rate uint))
+    (if (< rate min-rate)
+        min-rate
+        (if (> rate max-rate)
+            max-rate
+            rate
+        )
+    )
+)
+
+(define-private (calculate-new-popularity-score (current-score uint) (daily-usage uint) (weekly-usage uint))
+    (let (
+        (daily-factor (if (<= daily-usage u50) daily-usage u50)) ;; Cap daily influence
+        (weekly-factor (if (<= (/ weekly-usage u7) u20) (/ weekly-usage u7) u20)) ;; Average weekly influence
+        (new-score (+ current-score daily-factor weekly-factor))
+        (clamped-score (if (< new-score u10) u10 (if (> new-score u300) u300 new-score)))
+    )
+        clamped-score ;; Keep score between 10-300
+    )
+)
+
+(define-private (abs-diff (a uint) (b uint))
+    (if (>= a b) (- a b) (- b a))
+)
+
 (define-map dispute-votes
     {dispute-id: uint, voter: principal}
     {
@@ -778,3 +1073,5 @@
         )
     )
 )
+
+
